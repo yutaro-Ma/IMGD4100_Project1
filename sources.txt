@@ -30,7 +30,6 @@ src/agents/robinBaumgarten/Agent.java
 src/agents/robinBaumgarten/AStarTree.java
 src/agents/sergeyKarakovskiy/Agent.java
 src/agents/random/Agent.java
-src/agents/SolverAgent/SolverAgent.java
 src/agents/spencerSchumann/MotionSimulator.java
 src/agents/spencerSchumann/Tiles.java
 src/agents/spencerSchumann/Enemy.java
@@ -44,6 +43,8 @@ src/agents/spencerSchumann/Edge.java
 src/agents/spencerSchumann/MarioState.java
 src/agents/spencerSchumann/PlanRunner.java
 src/agents/human/Agent.java
+src/agents/myAgent/rhea_basic.java
+src/agents/myAgent/myAgent.java
 src/GenerateLevel.java
 src/engine/core/MarioWorld.java
 src/engine/core/MarioResult.java

@@ -3,207 +3,412 @@ package agents.myAgent;
 import engine.core.MarioAgent;
 import engine.core.MarioForwardModel;
 import engine.core.MarioTimer;
-
-import java.util.*;
+import engine.helper.MarioActions;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Deque;
+import java.util.List;
+import java.util.Random;
 
 public class myAgent implements MarioAgent {
+    // RHEA basics
+    private static final int HORIZON_TICKS = 18;
+    private static final int ROLLOUTS = 160;
+    private static final double WIN_BONUS = 6500;
+    private static final double DEATH_PEN = 12000;
+    private static final double TIME_COST = 0.18;
+    private static final double JUMP_COST = 0.05;
+    private static final double STALL_PEN = 2.5;
 
-    private static final int TICK_WALK = 10;
-    private static final int TICK_JUMP = 18;
-    private static final int TICK_WAIT = 12;
-    private static final float GOAL_X_MARGIN = 16f;
-    private static final float QUANT_POS = 2f;
-    private static final float QUANT_VEL = 0.25f;
-    private static final int MAX_EXPANSIONS = 25000;
-    private static final float DROP_THRESH = 1.5f;
+    private static final double ENEMY_DX_HITBOX = 18.0;
+    private static final double ENEMY_DY_HITBOX = 22.0;
+    private static final double ENEMY_ABOVE_EXTRA_PEN = 200.0;
 
-    private final ArrayDeque<boolean[]> actionQueue = new ArrayDeque<>();
+    private static final double MUT_JUMP_RATE = 0.12;
+    private static final double MUT_LEFT_RATE = 0.06;
+
+    private static final double INIT_JUMP_PROB = 0.24;
+    private static final double INIT_LEFT_PROB = 0.06;
+
+    private static final int STUCK_WINDOW = 16;
+    private static final double STUCK_EPS = 0.2;
+    private static final int FORCED_LONG_JUMP = 10;
+    private static final int FORCED_BACK_RUN = 8;
+
+    private static final int GOAL_CHECK_HORIZON = 80;
+    private static final int FINISH_JUMP_EARLY_HOLD = 6;
+    private static final int FINISH_JUMP_LATE_START = 4;
+    private static final int FINISH_JUMP_LATE_HOLD = 6;
+    private static final int FINISH_JUMP_2PH_A_START = 2;
+    private static final int FINISH_JUMP_2PH_A_HOLD = 4;
+    private static final int FINISH_JUMP_2PH_B_START = 10;
+    private static final int FINISH_JUMP_2PH_B_HOLD = 4;
+
+    private static final int OSC_WINDOW = 20;
+    private static final int OSC_TOGGLE_THRESH = 8;
+    private static final double OSC_PROGRESS_EPS = 1.2;
+    private static final int FINISH_LOCK_FRAMES = 30;
+
+    private int na;
+    private final Random rnd = new Random(20250928);
+
+    private boolean[][] jPlan;
+    private boolean[][] lPlan;
+
+    private double lastX = 0.0;
+    private int stuck = 0;
+    private int forceJ = 0;
+    private int forceB = 0;
+
+    private final Deque<Boolean> lHist = new ArrayDeque<>();
+    private final Deque<Double> xHist = new ArrayDeque<>();
+    private int lock = 0;
 
     @Override
-    public void initialize(MarioForwardModel model, MarioTimer timer) {
-        actionQueue.clear();
+    public void initialize(MarioForwardModel m, MarioTimer t) {
+        na = MarioActions.numberOfActions();
+        jPlan = new boolean[HORIZON_TICKS][1];
+        lPlan = new boolean[HORIZON_TICKS][1];
+        for (int i = 0; i < HORIZON_TICKS; i++) {
+            jPlan[i][0] = rnd.nextDouble() < INIT_JUMP_PROB;
+            lPlan[i][0] = rnd.nextDouble() < INIT_LEFT_PROB;
+        }
+        lastX = getMarioX(m);
+        stuck = 0;
+        forceJ = 0;
+        forceB = 0;
+        lHist.clear();
+        xHist.clear();
+        lock = 0;
     }
 
     @Override
-    public boolean[] getActions(MarioForwardModel model, MarioTimer timer) {
-        if (actionQueue.isEmpty()) plan(model);
-        return actionQueue.isEmpty() ? idle() : actionQueue.pollFirst();
-    }
+    public boolean[] getActions(MarioForwardModel m, MarioTimer t) {
+        boolean[] fin = tryFinishNow(m);
+        if (fin != null) {
+            lock = Math.max(lock, FINISH_LOCK_FRAMES);
+            fin[MarioActions.LEFT.getValue()] = false;
+            fin[MarioActions.RIGHT.getValue()] = true;
+            fin[MarioActions.SPEED.getValue()] = true;
+            forceB = 0;
+            forceJ = 0;
+            return fin;
+        }
 
-    @Override
-    public String getAgentName() { return "SolverAgent-Safe"; }
+        double x = getMarioX(m);
+        if (x - lastX < STUCK_EPS) stuck++; else stuck = 0;
+        lastX = x;
 
-    private void plan(MarioForwardModel root) {
-        PriorityQueue<Node> open = new PriorityQueue<>(Comparator.comparingDouble(n -> n.h));
-        HashSet<Long> closed = new HashSet<>();
+        double best = -1e30;
+        boolean[][] bj = jPlan, bl = lPlan;
+        for (int i = 0; i < ROLLOUTS; i++) {
+            boolean[][] cj = mutate1D(jPlan, MUT_JUMP_RATE);
+            boolean[][] cl = mutate1D(lPlan, MUT_LEFT_RATE);
+            double s = evaluatePlan(m, cj, cl);
+            if (s > best) { best = s; bj = cj; bl = cl; }
+        }
 
-        State s0 = State.fromModel(root);
-        Node n0 = new Node(s0, null, null, heuristic(s0));
-        open.add(n0);
+        boolean[] act = new boolean[na];
+        act[MarioActions.RIGHT.getValue()] = true;
+        act[MarioActions.SPEED.getValue()] = true;
 
-        int expansions = 0;
-        while (!open.isEmpty() && expansions < MAX_EXPANSIONS) {
-            Node cur = open.poll();
+        boolean wantL = bl[0][0];
+        pushHistory(wantL, x);
+        if (shouldFinishLock()) lock = Math.max(lock, FINISH_LOCK_FRAMES);
 
-            if (isGoal(cur.s, root)) {
-                replay(cur);
-                return;
+        if (lock > 0) {
+            wantL = false;
+            forceB = 0;
+            forceJ = 0;
+            lock--;
+        }
+
+        if (wantL) {
+            act[MarioActions.LEFT.getValue()] = true;
+            act[MarioActions.RIGHT.getValue()] = false;
+        }
+        act[MarioActions.JUMP.getValue()] = bj[0][0];
+
+        if (lock == 0) {
+            if (stuck >= STUCK_WINDOW) {
+                if (forceJ == 0 && forceB == 0) {
+                    if (isEnemyVeryClose(m)) forceB = FORCED_BACK_RUN;
+                    else forceJ = FORCED_LONG_JUMP;
+                }
+                stuck = 0;
             }
-
-            long key = cur.s.key();
-            if (!closed.add(key)) continue;
-
-            for (Macro m : MACROS) {
-                MarioForwardModel fm = root.clone();
-                Deque<Macro> hist = new ArrayDeque<>();
-                Node p = cur;
-                while (p.parent != null) { hist.addFirst(p.used); p = p.parent; }
-                for (Macro mm : hist) if (!simulateMacro(fm, mm)) { fm = null; break; }
-                if (fm == null) continue;
-
-                if (!simulateMacro(fm, m)) continue;
-
-                State sn = State.fromModel(fm);
-                Node nn = new Node(sn, cur, m, heuristic(sn));
-                if (!closed.contains(sn.key())) open.add(nn);
-                expansions++;
+            if (forceJ > 0) { act[MarioActions.JUMP.getValue()] = true; forceJ--; }
+            if (forceB > 0) {
+                act[MarioActions.LEFT.getValue()] = true;
+                act[MarioActions.RIGHT.getValue()] = false;
+                forceB--;
+            }
+            if (isOnGround(m) && enemyHitSoon(m)) {
+                act[MarioActions.LEFT.getValue()] = true;
+                act[MarioActions.RIGHT.getValue()] = false;
+                forceB = Math.max(forceB, 2);
+            }
+        } else {
+            if (x - meanRecentX() < STUCK_EPS * 0.5) {
+                act[MarioActions.JUMP.getValue()] = false;
             }
         }
 
-        for (int i = 0; i < 8; i++) actionQueue.addLast(actIdle());
+        jPlan = shiftAndRefill1D(bj, INIT_JUMP_PROB);
+        lPlan = shiftAndRefill1D(bl, INIT_LEFT_PROB);
+        return act;
     }
 
-    private boolean simulateMacro(MarioForwardModel fm, Macro m) {
-        switch (m.type) {
-            case WAIT: {
-                for (int t = 0; t < TICK_WAIT; t++) {
-                    if (!advanceSafe(fm, actIdle(), true)) return false;
-                }
-                return true;
+    @Override
+    public String getAgentName() { return "RHEA_SafeFast_FINISH_LOCK"; }
+
+    private boolean[] tryFinishNow(MarioForwardModel m) {
+        boolean[] a = macroFinish(m, new FP(0, 0, true));
+        if (a != null) return a;
+        a = macroFinish(m, new FP(0, FINISH_JUMP_EARLY_HOLD, true));
+        if (a != null) return a;
+        a = macroFinish(m, new FP(FINISH_JUMP_LATE_START, FINISH_JUMP_LATE_HOLD, true));
+        if (a != null) return a;
+        a = macroFinish(m, new FP(FINISH_JUMP_2PH_A_START, FINISH_JUMP_2PH_A_HOLD, true),
+                           new FP(FINISH_JUMP_2PH_B_START, FINISH_JUMP_2PH_B_HOLD, true));
+        if (a != null) return a;
+        a = macroFinish(m, new FP(0, 0, false), new FP(3, 0, true));
+        if (a != null) return a;
+        return macroFinish(m, new FP(0, 0, false), new FP(3, 0, true), new FP(6, 3, true));
+    }
+
+    private static class FP {
+        final int s, h; final boolean r;
+        FP(int s, int h, boolean r){ this.s = s; this.h = h; this.r = r; }
+    }
+
+    private boolean[] macroFinish(MarioForwardModel m, FP... ps) {
+        Object sim = safeCopyModel(m);
+        boolean[] first = null;
+        boolean[] jMask = new boolean[GOAL_CHECK_HORIZON];
+        boolean[] rMask = new boolean[GOAL_CHECK_HORIZON];
+        Arrays.fill(rMask, true);
+        for (FP p : ps) {
+            if (!p.r) for (int t = 0; t < Math.min(3, GOAL_CHECK_HORIZON); t++) rMask[t] = false;
+            for (int t = p.s; t < Math.min(GOAL_CHECK_HORIZON, p.s + p.h); t++) jMask[t] = true;
+        }
+        for (int t = 0; t < GOAL_CHECK_HORIZON; t++) {
+            boolean[] a = new boolean[na];
+            boolean r = rMask[t];
+            a[MarioActions.RIGHT.getValue()] = r;
+            a[MarioActions.SPEED.getValue()] = r;
+            a[MarioActions.JUMP.getValue()] = jMask[t];
+            if (t == 0) first = a.clone();
+            safeAdvance(sim, a);
+            if (isWin(sim)) return first;
+            if (isDead(sim)) return null;
+        }
+        return null;
+    }
+
+    private double evaluatePlan(MarioForwardModel m, boolean[][] jp, boolean[][] lp) {
+        Object sim = safeCopyModel(m);
+        double sx = getMarioX(sim), sc = 0.0, px = sx;
+        boolean latch = false; int stall = 0;
+        for (int t = 0; t < HORIZON_TICKS; t++) {
+            boolean[] a = new boolean[na];
+            a[MarioActions.RIGHT.getValue()] = true;
+            a[MarioActions.SPEED.getValue()] = true;
+            if (lp[t][0]) { a[MarioActions.LEFT.getValue()] = true; a[MarioActions.RIGHT.getValue()] = false; }
+            if (jp[t][0]) latch = true;
+            if (latch) {
+                if (canJump(sim)) { a[MarioActions.JUMP.getValue()] = true; latch = false; }
+                else a[MarioActions.JUMP.getValue()] = true;
+            } else a[MarioActions.JUMP.getValue()] = jp[t][0];
+
+            safeAdvance(sim, a);
+            if (isWin(sim)) {
+                double x = getMarioX(sim);
+                sc += (x - sx) + WIN_BONUS - TIME_COST * (t + 1);
+                return sc;
             }
-            case WALK_RIGHT: {
-                float lastY = fm.getMarioFloatPos()[1];
-                for (int t = 0; t < TICK_WALK; t++) {
-                    if (!advanceSafe(fm, actRightWalk(), false)) return false;
-                    float y = fm.getMarioFloatPos()[1];
-                    if (y - lastY > DROP_THRESH) return false;
-                    lastY = y;
+            if (isDead(sim)) { sc -= DEATH_PEN; return sc; }
+
+            double x = getMarioX(sim);
+            sc += (x - sx) / HORIZON_TICKS;
+            if (a[MarioActions.JUMP.getValue()]) sc -= JUMP_COST;
+            sc -= TIME_COST / HORIZON_TICKS;
+            if (x - px < STUCK_EPS * 0.5) { stall++; sc -= STALL_PEN * (stall * 0.12); } else { stall = 0; }
+            px = x;
+
+            double[] mp = getMarioXY(sim);
+            List<double[]> es = getEnemies(sim);
+            for (double[] e : es) {
+                double dx = e[0] - mp[0], dy = e[1] - mp[1];
+                if (Math.abs(dx) <= ENEMY_DX_HITBOX && Math.abs(dy) <= ENEMY_DY_HITBOX) {
+                    sc -= 60.0;
+                    if (dy < 6.0 && dy > -40.0) sc -= ENEMY_ABOVE_EXTRA_PEN;
+                    if (!lp[t][0] && a[MarioActions.JUMP.getValue()]) sc -= 80.0;
                 }
-                if (!fm.isMarioOnGround()) return false;
-                return true;
             }
-            case RUN_JUMP_RIGHT: {
-                float lastY = fm.getMarioFloatPos()[1];
-                for (int t = 0; t < TICK_JUMP; t++) {
-                    if (!advanceSafe(fm, actRightRunJump(), false)) return false;
-                    float y = fm.getMarioFloatPos()[1];
-                    if (t < 3 && y - lastY > DROP_THRESH) return false;
-                    lastY = y;
-                }
-                for (int t = 0; t < 6; t++) {
-                    if (!advanceSafe(fm, actRightWalk(), false)) return false;
-                }
-                return true;
-            }
-            case STEP_BACK: {
-                float lastY = fm.getMarioFloatPos()[1];
-                for (int t = 0; t < TICK_WALK; t++) {
-                    if (!advanceSafe(fm, actLeft(), false)) return false;
-                    float y = fm.getMarioFloatPos()[1];
-                    if (y - lastY > DROP_THRESH) return false;
-                    lastY = y;
-                }
-                if (!fm.isMarioOnGround()) return false;
-                return true;
-            }
+        }
+        sc += (getMarioX(sim) - sx);
+        return sc;
+    }
+
+    private void pushHistory(boolean l, double x) {
+        lHist.addLast(l);
+        xHist.addLast(x);
+        while (lHist.size() > OSC_WINDOW) lHist.removeFirst();
+        while (xHist.size() > OSC_WINDOW) xHist.removeFirst();
+    }
+
+    private boolean shouldFinishLock() {
+        if (lHist.size() < OSC_WINDOW || xHist.size() < OSC_WINDOW) return false;
+        int tog = 0; Boolean p = null;
+        for (Boolean b : lHist) { if (p != null && b != p) tog++; p = b; }
+        double prog = xHist.peekLast() - xHist.peekFirst();
+        return (tog >= OSC_TOGGLE_THRESH && prog < OSC_PROGRESS_EPS);
+    }
+
+    private double meanRecentX() {
+        if (xHist.isEmpty()) return 0.0;
+        double s = 0.0; for (double v : xHist) s += v; return s / xHist.size();
+    }
+
+    private boolean[][] mutate1D(boolean[][] src, double rate) {
+        boolean[][] out = new boolean[src.length][1];
+        for (int i = 0; i < src.length; i++) {
+            boolean v = src[i][0];
+            if (rnd.nextDouble() < rate) v = !v;
+            out[i][0] = v;
+        }
+        return out;
+    }
+
+    private boolean[][] shiftAndRefill1D(boolean[][] p, double pInit) {
+        boolean[][] out = new boolean[p.length][1];
+        for (int i = 0; i < p.length - 1; i++) out[i][0] = p[i + 1][0];
+        out[p.length - 1][0] = rnd.nextDouble() < pInit;
+        return out;
+    }
+
+    private boolean isEnemyVeryClose(Object m) {
+        double[] mp = getMarioXY(m);
+        for (double[] e : getEnemies(m)) {
+            if (Math.abs(e[0] - mp[0]) <= ENEMY_DX_HITBOX && Math.abs(e[1] - mp[1]) <= ENEMY_DY_HITBOX) return true;
         }
         return false;
     }
 
-    private boolean advanceSafe(MarioForwardModel fm, boolean[] action, boolean allowFall) {
-        fm.advance(action);
-        float[] pos = fm.getMarioFloatPos();
-        if (!fm.isMarioAlive()) return false;
-        if (!allowFall && pos[1] > 3000f) return false;
-        return true;
+    private boolean enemyHitSoon(Object m) {
+        double[] mp = getMarioXY(m);
+        for (double[] e : getEnemies(m)) {
+            double dx = e[0] - mp[0], dy = e[1] - mp[1];
+            if (dx > -8 && dx < ENEMY_DX_HITBOX && Math.abs(dy) <= ENEMY_DY_HITBOX) return true;
+        }
+        return false;
     }
 
-    private boolean isGoal(State s, MarioForwardModel root) {
-        float goalX = root.getLevelFloatDimensions()[0] - GOAL_X_MARGIN;
-        return s.x >= goalX;
+    private boolean isOnGround(Object m) {
+        try {
+            Object v = m.getClass().getMethod("isMarioOnGround").invoke(m);
+            if (v instanceof Boolean) return (Boolean) v;
+        } catch (Throwable ignored) {}
+        return false;
     }
 
-    private void replay(Node goal) {
-        ArrayDeque<Macro> seq = new ArrayDeque<>();
-        Node p = goal;
-        while (p.parent != null) { seq.addFirst(p.used); p = p.parent; }
-        for (Macro m : seq) {
-            switch (m.type) {
-                case WAIT:
-                    for (int t = 0; t < TICK_WAIT; t++) actionQueue.addLast(actIdle());
-                    break;
-                case WALK_RIGHT:
-                    for (int t = 0; t < TICK_WALK; t++) actionQueue.addLast(actRightWalk());
-                    break;
-                case RUN_JUMP_RIGHT:
-                    for (int t = 0; t < TICK_JUMP; t++) actionQueue.addLast(actRightRunJump());
-                    for (int t = 0; t < 6; t++) actionQueue.addLast(actRightWalk());
-                    break;
-                case STEP_BACK:
-                    for (int t = 0; t < TICK_WALK; t++) actionQueue.addLast(actLeft());
-                    break;
+    private Object safeCopyModel(Object m) {
+        try { return m.getClass().getMethod("copy").invoke(m); } catch (Throwable ignored) {}
+        try { return m.getClass().getMethod("clone").invoke(m); } catch (Throwable ignored) {}
+        try { return m.getClass().getConstructor(m.getClass()).newInstance(m); } catch (Throwable ignored) {}
+        return m;
+    }
+
+    private void safeAdvance(Object m, boolean[] a) {
+        try { m.getClass().getMethod("advance", boolean[].class).invoke(m, (Object) a); } catch (Throwable ignored) {}
+    }
+
+    private double getMarioX(Object m) {
+        try {
+            Object res = m.getClass().getMethod("getMarioFloatPos").invoke(m);
+            if (res instanceof float[]) return ((float[]) res)[0];
+        } catch (Throwable ignored) {}
+        try {
+            Object v = m.getClass().getMethod("getMarioX").invoke(m);
+            if (v instanceof Number) return ((Number) v).doubleValue();
+        } catch (Throwable ignored) {}
+        try {
+            Object v = m.getClass().getMethod("getGameScore").invoke(m);
+            if (v instanceof Number) return ((Number) v).doubleValue();
+        } catch (Throwable ignored) {}
+        return 0.0;
+    }
+
+    private double[] getMarioXY(Object m) {
+        try {
+            Object res = m.getClass().getMethod("getMarioFloatPos").invoke(m);
+            if (res instanceof float[]) {
+                float[] p = (float[]) res;
+                return new double[] { p[0], p[1] };
             }
-        }
-        if (actionQueue.isEmpty()) for (int i = 0; i < 12; i++) actionQueue.addLast(actRightWalk());
+        } catch (Throwable ignored) {}
+        return new double[] { getMarioX(m), 0.0 };
     }
 
-    private double heuristic(State s) {
-        return -s.x + 0.001 * s.y;
+    private List<double[]> getEnemies(Object m) {
+        List<double[]> out = new ArrayList<>();
+        try {
+            Object res = m.getClass().getMethod("getEnemiesFloatPos").invoke(m);
+            if (res instanceof float[][]) {
+                float[][] arr = (float[][]) res;
+                for (float[] e : arr) { if (e != null && e.length >= 2) out.add(new double[] { e[0], e[1] }); }
+                return out;
+            }
+            if (res instanceof float[]) {
+                float[] arr = (float[]) res;
+                if (arr.length % 3 == 0) { for (int i = 0; i < arr.length; i += 3) out.add(new double[] { arr[i], arr[i+1] }); return out; }
+                if (arr.length % 2 == 0) { for (int i = 0; i < arr.length; i += 2) out.add(new double[] { arr[i], arr[i+1] }); return out; }
+            }
+        } catch (Throwable ignored) {}
+        return out;
     }
 
-    private static boolean[] idle() { return new boolean[]{false,false,false,false,false,false}; }
-    private static boolean[] actIdle() { return idle(); }
-    private static boolean[] actRightWalk() { return new boolean[]{false,true,false,false,false,false}; }
-    private static boolean[] actRightRunJump() { return new boolean[]{false,true,false,true,true,false}; }
-    private static boolean[] actLeft() { return new boolean[]{true,false,false,false,false,false}; }
-
-    private enum MacroType { WAIT, WALK_RIGHT, RUN_JUMP_RIGHT, STEP_BACK }
-    private static class Macro { final MacroType type; Macro(MacroType t){ this.type=t; } }
-    private static final Macro[] MACROS = new Macro[] {
-            new Macro(MacroType.WAIT),
-            new Macro(MacroType.RUN_JUMP_RIGHT),
-            new Macro(MacroType.WALK_RIGHT),
-            new Macro(MacroType.STEP_BACK),
-    };
-
-    private static class Node {
-        final State s; final Node parent; final Macro used; final double h;
-        Node(State s, Node p, Macro u, double h){ this.s=s; this.parent=p; this.used=u; this.h=h; }
+    private boolean canJump(Object m) {
+        try {
+            Object v = m.getClass().getMethod("isMarioOnGround").invoke(m);
+            if (v instanceof Boolean && (Boolean) v) return true;
+        } catch (Throwable ignored) {}
+        try {
+            Object v = m.getClass().getMethod("mayMarioJump").invoke(m);
+            if (v instanceof Boolean) return (Boolean) v;
+        } catch (Throwable ignored) {}
+        try {
+            Object v = m.getClass().getMethod("isMarioAbleToJump").invoke(m);
+            if (v instanceof Boolean) return (Boolean) v;
+        } catch (Throwable ignored) {}
+        return false;
     }
 
-    private static class State {
-        final float x, y, vx, vy; final boolean onGround;
-        private State(float x,float y,float vx,float vy,boolean g){ this.x=x; this.y=y; this.vx=vx; this.vy=vy; this.onGround=g; }
-        static State fromModel(MarioForwardModel m){
-            float[] pos = m.getMarioFloatPos();
-            float[] vel = m.getMarioVelocity();
-            boolean on = m.isMarioOnGround();
-            float qx = quant(pos[0], QUANT_POS);
-            float qy = quant(pos[1], QUANT_POS);
-            float qvx = quant(vel[0], QUANT_VEL);
-            float qvy = quant(vel[1], QUANT_VEL);
-            return new State(qx,qy,qvx,qvy,on);
-        }
-        static float quant(float v,float q){ return (float)Math.floor(v/q)*q; }
-        long key(){
-            long kx = Float.floatToIntBits(x);
-            long ky = Float.floatToIntBits(y);
-            long kvx= Float.floatToIntBits(vx);
-            long kvy= Float.floatToIntBits(vy);
-            long on = onGround ? 1L : 0L;
-            long h1 = kx ^ (ky << 1);
-            long h2 = kvx ^ (kvy << 1);
-            return (h1 * 1315423911L) ^ (h2 * 2654435761L) ^ on;
-        }
+    private boolean isDead(Object m) {
+        try {
+            Object v = m.getClass().getMethod("isMarioDead").invoke(m);
+            if (v instanceof Boolean) return (Boolean) v;
+        } catch (Throwable ignored) {}
+        Integer s = getGameStatus(m);
+        return s != null && (s == 2 || s == -1);
+    }
+
+    private boolean isWin(Object m) {
+        try {
+            Object v = m.getClass().getMethod("isMarioWin").invoke(m);
+            if (v instanceof Boolean) return (Boolean) v;
+        } catch (Throwable ignored) {}
+        Integer s = getGameStatus(m);
+        return s != null && s == 1;
+    }
+
+    private Integer getGameStatus(Object m) {
+        try {
+            Object v = m.getClass().getMethod("getGameStatus").invoke(m);
+            if (v instanceof Number) return ((Number) v).intValue();
+        } catch (Throwable ignored) {}
+        return null;
     }
 }
